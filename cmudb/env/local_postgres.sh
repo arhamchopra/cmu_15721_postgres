@@ -13,11 +13,11 @@ ROOT_DIR=$(pwd)
 
 mkdir -p "${BUILD_DIR}"
 echo "You may want to comment out the configure step if you're not regularly switching between debug and release."
-./cmudb/build/configure.sh debug "${BUILD_DIR}"
-make install -j
-rm -rf "${BIN_DIR}"/pgdata
-"${BIN_DIR}"/initdb -D "${BIN_DIR}"/pgdata
-cp ./cmudb/env/pgtune.auto.conf "${BIN_DIR}"/pgdata/postgresql.auto.conf
+# ./cmudb/build/configure.sh debug "${BUILD_DIR}"
+# make install -j
+# rm -rf "${BIN_DIR}"/pgdata
+# "${BIN_DIR}"/initdb -D "${BIN_DIR}"/pgdata
+# cp ./cmudb/env/pgtune.auto.conf "${BIN_DIR}"/pgdata/postgresql.auto.conf
 
 cd ./cmudb/extensions/db721_fdw/
 make clean
