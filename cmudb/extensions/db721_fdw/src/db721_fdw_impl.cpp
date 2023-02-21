@@ -60,6 +60,7 @@ using JsonType = nlohmann::json;
 #include <variant>
 #include <cassert>
 #include <map>
+#include <set>
 #include <vector>
 #include <string>
 #include <fstream>
@@ -94,10 +95,6 @@ int data_type_to_size(DataType dt) {
     case StringType: return 32;
   }
 }
-
-struct db721_BlockMetadataInt;
-struct db721_BlockMetadataFloat;
-struct db721_BlockMetadataString;
 
 struct db721_BlockMetadataInt {
   int max_val;
@@ -165,7 +162,7 @@ struct db721_ColumnMetadata {
   int start_offset = 0;
   string data_type_str = "";
   DataType data_type = NoneType;
-  int data_size = 0;
+  int data_size = 32;
 
   db721_ColumnMetadata () {}
 
@@ -244,114 +241,17 @@ struct db721_TableInfo {
   string tablename;
 };
 
-void initialize(Oid foreigntableid, db721_TableInfo &info) {
-  int metadata_size = 0;
-  ifstream fs (info.filename, ifstream::binary);
-  // Get metadata size
-  fs.seekg(-4, fs.end);
-  fs.read((char*)(&metadata_size), 4);
-  // Get metadata as json
-  fs.seekg(-1*(metadata_size + 4), fs.end);
-  char* metadata_str = new char[metadata_size + 1]();
-  fs.read(metadata_str, metadata_size);
-  // TODO: Fix so that both lines below become one
-  gMetadataMap.emplace(foreigntableid, JsonType::parse(metadata_str));
-  gMetadataMap[foreigntableid].filename = info.filename;
-}
-
-void get_foreign_table_info(Oid foreigntableid, db721_TableInfo &info) {
-  ForeignTable* table = GetForeignTable(foreigntableid);
-  auto opt_list = table->options;
-  for(int i = 0; i < opt_list->length; i++) {
-    ListCell *lc = &(opt_list->elements[i]);
-    auto def = (DefElem*) lfirst(lc);
-    if (def->defnamespace != nullptr ) {
-      cout << " Found namespace " << string(def->defnamespace) << endl;
-    }
-    if (string(def->defname) == "filename") {
-      info.filename = defGetString(def);
-      cout << " Found filename " << info.filename << endl;
-    } else if (string(def->defname) == "tablename") {
-      info.tablename = defGetString(def);
-      cout << " Found tablename " << info.tablename << endl;
-    }
-  }
-}
-
-pair<Cost, Cost> estimate_costs(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid) {
-  return make_pair(0.0, 0.0);
-}
-
-extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
-                                      Oid foreigntableid) {
-  db721_TableInfo info;
-  get_foreign_table_info(foreigntableid, info);
-
-  if (gMetadataMap.find(foreigntableid) == gMetadataMap.end()) {
-    initialize(foreigntableid, info);
-  }
-  auto& metadata = gMetadataMap[foreigntableid];
-  auto& col_data = (metadata.column_map.begin()->second);
-  int num_rows = 0;
-  for(auto& blk: col_data.block_list) {
-    int cur_blk_rows = 0;
-    switch (col_data.data_type) {
-      case IntType: { cur_blk_rows = get<db721_BlockMetadataInt>(blk).num_val; break; }
-      case FloatType: { cur_blk_rows = get<db721_BlockMetadataFloat>(blk).num_val; break; }
-      case StringType: { cur_blk_rows = get<db721_BlockMetadataString>(blk).num_val; break; }
-      default: { cout << "Error: NoneType found" << endl; break;}
-    }
-    num_rows += cur_blk_rows;
-  }
-  metadata.num_rows = num_rows;
-  baserel->fdw_private = &metadata;
-  // TODO : Account of the "WHERE" filters
-  baserel->rows = num_rows;
-  // TODO : Update the width in baserel as well
-  baserel->tuples = num_rows;
-}
-
-extern "C" void db721_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
-                                    Oid foreigntableid) {
-  // TODO(721): Write me!
-  Dog scout("Scout");
-  elog(LOG, "db721_GetForeignPaths: %s", scout.Bark().c_str());
-  Cost startup_cost = 0;
-  Cost run_cost = 0;
-  tie(startup_cost, run_cost) = estimate_costs(root, baserel, foreigntableid);
-  auto* foreign_path = (Path*) create_foreignscan_path(root,
-                                                       baserel,
-                                                       NULL,
-                                                       baserel->rows,
-                                                       startup_cost, startup_cost + run_cost,
-                                                       NULL,
-                                                       NULL,
-                                                       NULL,
-                                                       (List*) baserel->fdw_private);
-  add_path(baserel, (Path*) foreign_path);
-}
-
-extern "C" ForeignScan *
-db721_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
-                   ForeignPath *best_path, List *tlist, List *scan_clauses,
-                   Plan *outer_plan) {
-  // TODO(721): Write me!
-  // extern ForeignScan *make_foreignscan(List *qptlist, List *qpqual,
-  //                    Index scanrelid, List *fdw_exprs, List *fdw_private,
-  //                    List *fdw_scan_tlist, List *fdw_recheck_quals,
-  //                    Plan *outer_plan);
-  return make_foreignscan(tlist, nullptr, baserel->relid, nullptr, (List*)(baserel->fdw_private), nullptr, nullptr, outer_plan);
-}
-
 struct db721_ScanState {
   db721_TableMetadata* metadata;
   ifstream fs;
   int cur_row = 0;
+  set<int> attrs_used;
+  set<int> attrs_returned;
 
   db721_ScanState (db721_TableMetadata* metadata):
     metadata(metadata),
     fs(metadata->filename, ifstream::binary),
-    cur_row(0) { }
+    cur_row(0) {}
 
   TupleTableSlot* next(TupleTableSlot* slot) {
     if (cur_row == metadata->num_rows) {
@@ -359,7 +259,11 @@ struct db721_ScanState {
     }
     auto* tuple_desc = slot->tts_tupleDescriptor;
     for(int attr = 0; attr < tuple_desc->natts; ++attr) {
-      auto col_name = string(tuple_desc->attrs[attr].attname.data);
+      AttrNumber attrnum = attr + 1 - FirstLowInvalidHeapAttributeNumber;
+      slot->tts_isnull[attrnum] = true;
+      auto col_name = string(NameStr(TupleDescAttr(tuple_desc, attr)->attname));
+      if (attrs_used.find(attrnum) == attrs_used.end()) continue;
+      debug("Fetching column " + col_name);
       auto& col_data = metadata->column_map[col_name];
       fs.seekg(col_data.start_offset + cur_row * col_data.data_size);
       switch (col_data.data_type) {
@@ -391,10 +295,157 @@ struct db721_ScanState {
   }
 };
 
+struct db721_QueryPlan {
+  db721_TableMetadata* metadata;
+  Bitmapset* attrs_returned;
+  Bitmapset* attrs_used;
+
+  db721_QueryPlan() {}
+  db721_QueryPlan(db721_TableMetadata* metadata):
+    metadata(metadata) {
+    }
+};
+
+void initialize(Oid foreigntableid, db721_TableInfo &info) {
+  int metadata_size = 0;
+  ifstream fs (info.filename, ifstream::binary);
+  // Get metadata size
+  fs.seekg(-4, fs.end);
+  fs.read((char*)(&metadata_size), 4);
+  // Get metadata as json
+  fs.seekg(-1*(metadata_size + 4), fs.end);
+  char* metadata_str = new char[metadata_size + 1]();
+  fs.read(metadata_str, metadata_size);
+  // TODO: Fix so that both lines below become one
+  gMetadataMap.emplace(foreigntableid, JsonType::parse(metadata_str));
+  gMetadataMap[foreigntableid].filename = info.filename;
+}
+
+void get_foreign_table_info(Oid foreigntableid, db721_TableInfo &info) {
+  ForeignTable* table = GetForeignTable(foreigntableid);
+  auto opt_list = table->options;
+  for(int i = 0; i < opt_list->length; i++) {
+    ListCell *lc = &(opt_list->elements[i]);
+    auto def = (DefElem*) lfirst(lc);
+    if (def->defnamespace != nullptr ) {
+      cout << "Found namespace " << string(def->defnamespace) << endl;
+    }
+    if (string(def->defname) == "filename") {
+      info.filename = defGetString(def);
+      cout << "Found filename " << info.filename << endl;
+    } else if (string(def->defname) == "tablename") {
+      info.tablename = defGetString(def);
+      cout << "Found tablename " << info.tablename << endl;
+    }
+  }
+}
+
+pair<Cost, Cost> estimate_costs(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid) {
+  return make_pair(0.0, 0.0);
+}
+
+void get_relevant_attrs(RelOptInfo* baserel) {
+    db721_QueryPlan* query_plan = (db721_QueryPlan*) baserel->fdw_private;
+    pull_varattnos((Node *) baserel->reltarget->exprs, baserel->relid, &query_plan->attrs_used);
+    ListCell *lc;
+    foreach(lc, baserel->baserestrictinfo)
+    {
+        RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+        pull_varattnos((Node *) rinfo->clause, baserel->relid, &query_plan->attrs_used);
+    }
+
+    if (bms_is_empty(query_plan->attrs_used))
+    {
+        bms_free(query_plan->attrs_used);
+        query_plan->attrs_used = bms_make_singleton(1 - FirstLowInvalidHeapAttributeNumber);
+    }
+}
+
+extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
+                                      Oid foreigntableid) {
+  db721_TableInfo info;
+  get_foreign_table_info(foreigntableid, info);
+
+  if (gMetadataMap.find(foreigntableid) == gMetadataMap.end()) {
+    initialize(foreigntableid, info);
+  }
+  auto& metadata = gMetadataMap[foreigntableid];
+  int* attr_widths = new int[metadata.column_map.size()]();
+  int row_width = 0;
+  for(auto& [col_name, col_data]: metadata.column_map) {
+    row_width += col_data.data_size;
+  }
+  auto& col_data = (metadata.column_map.begin()->second);
+  int num_rows = 0;
+  for(auto& blk: col_data.block_list) {
+    int cur_blk_rows = 0;
+    switch (col_data.data_type) {
+      case IntType: { cur_blk_rows = get<db721_BlockMetadataInt>(blk).num_val; break; }
+      case FloatType: { cur_blk_rows = get<db721_BlockMetadataFloat>(blk).num_val; break; }
+      case StringType: { cur_blk_rows = get<db721_BlockMetadataString>(blk).num_val; break; }
+      default: { cout << "Error: NoneType found" << endl; break;}
+    }
+    num_rows += cur_blk_rows;
+  }
+  metadata.num_rows = num_rows;
+  baserel->fdw_private = &metadata;
+
+  // TODO : Account of the "WHERE" filters
+  baserel->rows = num_rows;
+  baserel->reltarget->width = row_width;
+  baserel->tuples = num_rows;
+}
+
+extern "C" void db721_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
+                                    Oid foreigntableid) {
+  debug("Getting paths!");
+  Cost startup_cost = 0;
+  Cost run_cost = 0;
+  auto* metadata = (db721_TableMetadata*) baserel->fdw_private;
+  auto* query_plan = (db721_QueryPlan*) palloc0(sizeof(db721_QueryPlan));
+  query_plan->metadata = metadata;
+
+  baserel->fdw_private = query_plan;
+  get_relevant_attrs(baserel);
+
+  tie(startup_cost, run_cost) = estimate_costs(root, baserel, foreigntableid);
+  auto* foreign_path = (Path*) create_foreignscan_path(root,
+                                                       baserel,
+                                                       NULL,
+                                                       baserel->rows,
+                                                       startup_cost, startup_cost + run_cost,
+                                                       NULL,
+                                                       NULL,
+                                                       NULL,
+                                                       (List*) baserel->fdw_private);
+  add_path(baserel, (Path*) foreign_path);
+}
+
+extern "C" ForeignScan *
+db721_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
+                   ForeignPath *best_path, List *tlist, List *scan_clauses,
+                   Plan *outer_plan) {
+  // TODO(721): Write me!
+  // extern ForeignScan *make_foreignscan(List *qptlist, List *qpqual,
+  //                    Index scanrelid, List *fdw_exprs, List *fdw_private,
+  //                    List *fdw_scan_tlist, List *fdw_recheck_quals,
+  //                    Plan *outer_plan);
+  debug("Beginning scan! again");
+  scan_clauses = extract_actual_clauses(scan_clauses, false);
+
+  auto* query_plan = (db721_QueryPlan*) baserel->fdw_private;
+  auto* ss = new db721_ScanState(query_plan->metadata);
+  AttrNumber attr = -1;
+  while ((attr = bms_next_member(query_plan->attrs_used, attr)) >= 0) {
+    ss->attrs_used.insert(attr);
+  }
+  baserel->fdw_private = ss;
+  return make_foreignscan(tlist, scan_clauses, baserel->relid, nullptr, (List*)(baserel->fdw_private), nullptr, nullptr, outer_plan);
+}
+
 extern "C" void db721_BeginForeignScan(ForeignScanState *node, int eflags) {
   ForeignScan* plan = (ForeignScan*) node->ss.ps.plan;
-  auto scan_state = new db721_ScanState((db721_TableMetadata*)plan->fdw_private);
-  node->fdw_state = scan_state;
+  node->fdw_state = plan->fdw_private;
 }
 
 extern "C" TupleTableSlot *db721_IterateForeignScan(ForeignScanState *node) {
