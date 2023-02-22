@@ -71,7 +71,7 @@ using namespace::std;
 #include <iostream>
 
 void debug(string str) {
-  cout << str << endl;
+  // cout << str << endl;
 }
 
 enum DataType {
@@ -341,8 +341,7 @@ struct db721_ScanState {
                   if (!satisfies) {
                     attr = -1;
                     cur_row++;
-                    debug("Skipping on BTLess(Eq) " + col_name);
-                    continue;
+                    // debug("Skipping on BTLess(Eq) " + col_name);
                   }
                   break;
                 }
@@ -361,8 +360,7 @@ struct db721_ScanState {
                   if (!satisfies) {
                     attr = -1;
                     cur_row++;
-                    debug("Skipping on BTLess(Eq)" + col_name);
-                    continue;
+                    // debug("Skipping on BTLess(Eq)" + col_name);
                   }
                   break;
                 }
@@ -382,8 +380,7 @@ struct db721_ScanState {
                   if (!satisfies) {
                     attr = -1;
                     cur_row++;
-                    debug("Skipping on BTGreate(Eq)" + col_name);
-                    continue;
+                    // debug("Skipping on BTGreate(Eq)" + col_name);
                   }
                   break;
                 }
@@ -402,8 +399,7 @@ struct db721_ScanState {
                   if (!satisfies) {
                     attr = -1;
                     cur_row++;
-                    debug("Skipping on BTGreate(Eq)" + col_name);
-                    continue;
+                    // debug("Skipping on BTGreate(Eq)" + col_name);
                   }
                   break;
                 }
@@ -420,10 +416,9 @@ struct db721_ScanState {
                   }
 
                   if (!satisfies) {
+                    // debug(to_string(cur_row) + ": Skipping on Equal(Eq)" + col_name);
                     attr = -1;
                     cur_row++;
-                    debug("Skipping on Equal(Eq)" + col_name);
-                    continue;
                   }
                   break;
                 }
@@ -433,6 +428,7 @@ struct db721_ScanState {
                 Assert(false);
             }
           }
+          if (attr == -1) break;
         }
       }
     }
@@ -567,7 +563,7 @@ void extract_row_filters(RelOptInfo* baserel, map<AttrNumber, vector<RowFilter>>
         }
         c = (Const *) right;
         opno = expr->opno;
-        debug("Const Op " + to_string(opno));
+        // debug("Const Op " + to_string(opno));
       }
       else if (IsA(left, Const))
       {
@@ -596,7 +592,7 @@ void extract_row_filters(RelOptInfo* baserel, map<AttrNumber, vector<RowFilter>>
       auto op_family = get_opclass_family(op_class);
       int strategy = get_op_opfamily_strategy(opno, op_family);
       if (strategy == 0) {
-        debug("BTREE_AM_OID not useful, trying negation of operator");
+        // debug("BTREE_AM_OID not useful, trying negation of operator");
         opno = get_negator(opno);
         op_class = GetDefaultOpClass(v->vartype, BTREE_AM_OID);
         if (not OidIsValid(op_class)) continue;
