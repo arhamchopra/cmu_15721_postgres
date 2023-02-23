@@ -142,6 +142,8 @@ using db721_BlockMetadata = std::variant<db721_BlockMetadataInt, db721_BlockMeta
 
 struct db721_ColumnMetadata {
   vector<db721_BlockMetadata> block_list;
+  vector<int> block_offset_list;
+  vector<int> row_count_list;
   int num_blocks;
   int start_offset;
   DataType data_type;
@@ -160,11 +162,33 @@ struct db721_ColumnMetadata {
     data_size(data_type_to_size(data_type))
   {
     auto& block_stats = json_obj["block_stats"];
+    int start_offset = json_obj["start_offset"];
     for(auto it = block_stats.begin(); it != block_stats.end(); ++it) {
       switch (data_type) {
-        case IntType: { block_list.emplace_back(db721_BlockMetadataInt(it.value())); break; }
-        case FloatType: { block_list.emplace_back(db721_BlockMetadataFloat(it.value())); break; }
-        case StringType: { block_list.emplace_back(db721_BlockMetadataString(it.value())); break; }
+        case IntType: {
+                        auto blk = db721_BlockMetadataInt(it.value());
+                        block_list.emplace_back(blk);
+                        block_offset_list.push_back(start_offset);
+                        row_count_list.push_back(blk.num_val);
+                        start_offset += blk.num_val * data_size;
+                        break;
+                      }
+        case FloatType: {
+                          auto blk = db721_BlockMetadataFloat(it.value());
+                          block_list.emplace_back(blk);
+                          block_offset_list.push_back(start_offset);
+                          row_count_list.push_back(blk.num_val);
+                          start_offset += blk.num_val * data_size;
+                          break;
+                        }
+        case StringType: {
+                           auto blk = db721_BlockMetadataString(it.value());
+                           block_list.emplace_back(blk);
+                           block_offset_list.push_back(start_offset);
+                           row_count_list.push_back(blk.num_val);
+                           start_offset += blk.num_val * data_size;
+                           break;
+                         }
         default: { cout << "Error: NoneType found" << endl; break;}
       }
     }
@@ -242,23 +266,23 @@ struct db721_TableMetadata {
 
 map<Oid, db721_TableMetadata> gMetadataMap;
 
-void extract_next_datum(ifstream &fs, db721_ColumnMetadata &col_data, Datum &datum) {
+void extract_next_datum(char* data_array, db721_ColumnMetadata &col_data, int idx, Datum &datum) {
   switch (col_data.data_type) {
     case IntType: {
                     int val = 0;
-                    fs.read((char*)&val, col_data.data_size);
+                    memcpy((char*)&val, (data_array + col_data.data_size * idx), col_data.data_size);
                     datum = Int32GetDatum(val);
                     break;
                   }
     case FloatType: {
                       float val = 0;
-                      fs.read((char*)&val, col_data.data_size);
+                      memcpy((char*)&val, (data_array + col_data.data_size * idx), col_data.data_size);
                       datum = Float4GetDatum(val);
                       break;
                     }
     case StringType: {
-                       char val[32] = {};
-                       fs.read(val, col_data.data_size);
+                       char val[33] = {};
+                       memcpy(val, (data_array + col_data.data_size * idx), col_data.data_size);
                        datum = CStringGetTextDatum(val);
                        break;
                      }
@@ -272,20 +296,24 @@ void extract_next_datum(ifstream &fs, db721_ColumnMetadata &col_data, Datum &dat
 struct db721_ScanState {
   db721_TableMetadata* metadata;
   vector<ifstream> fds;
-  ifstream fs;
-  int cur_row = 0;
+  int cur_row_in_block = 0;
+  int num_rows_in_block = 0;
   vector<AttrNumber> v_attrs_used;
   vector<AttrNumber> v_attrs_returned;
-  set<int> attrs_used;
-  set<int> attrs_returned;
+  vector<AttrNumber> v_attrs_combined;
+  vector<char*> block_data;
+  int next_block = 0;
+  int num_blocks = 0;
 
   db721_ScanState (db721_TableMetadata* metadata):
     metadata(metadata),
-    fs(metadata->filename, ifstream::binary),
-    cur_row(0) {
+    cur_row_in_block(0),
+    num_rows_in_block(0),
+    next_block(0) {
+      num_blocks = metadata->column_data[0].num_blocks;
       for(auto &col: metadata->column_data) {
         fds.emplace_back(metadata->filename, ifstream::binary);
-        fds.back().seekg(col.start_offset);
+        block_data.push_back((char*)palloc(metadata->max_val_per_block * col.data_size));
       }
     }
 
@@ -294,18 +322,29 @@ struct db721_ScanState {
     auto* tuple_desc = slot->tts_tupleDescriptor;
     // TODO: Fix bug to process the whole tuple each time
     while(true) {
-      if (cur_row >= metadata->num_rows) {
-        return nullptr;
+      if (cur_row_in_block >= num_rows_in_block) {
+        if (next_block >= num_blocks) {
+          return nullptr;
+        }
+        for(size_t attr_idx = 0; attr_idx < v_attrs_combined.size(); attr_idx++) {
+          auto attrnum = v_attrs_combined[attr_idx];
+          auto &col_data = metadata->column_data[attrnum];
+          auto &fs = fds[attrnum];
+          fs.seekg(col_data.block_offset_list[next_block]);
+          fs.read(block_data[attrnum], col_data.row_count_list[next_block] * col_data.data_size);
+          num_rows_in_block = col_data.row_count_list[next_block];
+        }
+        next_block++;
+        cur_row_in_block = 0;
       }
+
       bool found = true;
       for(size_t attr_idx = 0; attr_idx < v_attrs_used.size(); attr_idx++) {
         auto attrnum = v_attrs_used[attr_idx];
         auto &col_data = metadata->column_data[attrnum];
-        auto &fs = fds[attrnum];
-        fs.seekg(col_data.start_offset + cur_row * col_data.data_size);
 
         Datum data;
-        extract_next_datum(fs, col_data, data);
+        extract_next_datum(block_data[attrnum], col_data, cur_row_in_block, data);
         for(auto &rf: rfs[attrnum]) {
 
           Datum     const_val = rf.const_val->constvalue;
@@ -352,7 +391,7 @@ struct db721_ScanState {
         if (not found) { break; }
       }
       if(not found) {
-        cur_row++;
+        cur_row_in_block++;
       } else {
         break;
       }
@@ -365,12 +404,10 @@ struct db721_ScanState {
     for(size_t attr_idx = 0; attr_idx < v_attrs_returned.size(); attr_idx++) {
       auto attrnum = v_attrs_returned[attr_idx];
       auto &col_data = metadata->column_data[attrnum];
-      auto &fs = fds[attrnum];
-      fs.seekg(col_data.start_offset + cur_row * col_data.data_size);
-      extract_next_datum(fs, col_data, slot->tts_values[attrnum]);
+      extract_next_datum(block_data[attrnum], col_data, cur_row_in_block, slot->tts_values[attrnum]);
       slot->tts_isnull[attrnum] = false;
     }
-    cur_row++;
+    cur_row_in_block++;
   // text* t = (text*) palloc(col_data.data_size+VARHDRSZ);
   // char data[32] = {};
   // fs.read(data, col_data.data_size);
@@ -587,15 +624,19 @@ db721_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
   auto* query_plan = (db721_QueryPlan*) baserel->fdw_private;
   auto* ss = new db721_ScanState(query_plan->metadata);
   AttrNumber attr = -1;
+  set<AttrNumber> all_attr;
   while ((attr = bms_next_member(query_plan->attrs_used, attr)) >= 0) {
     ss->v_attrs_used.push_back(attr - (1 - FirstLowInvalidHeapAttributeNumber));
+    all_attr.insert(attr - (1 - FirstLowInvalidHeapAttributeNumber));
   }
   sort(ss->v_attrs_used.begin(), ss->v_attrs_used.end());
   attr = -1;
   while ((attr = bms_next_member(query_plan->attrs_returned, attr)) >= 0) {
     ss->v_attrs_returned.push_back(attr - (1 - FirstLowInvalidHeapAttributeNumber));
+    all_attr.insert(attr - (1 - FirstLowInvalidHeapAttributeNumber));
   }
   sort(ss->v_attrs_returned.begin(), ss->v_attrs_returned.end());
+  ss->v_attrs_combined = vector(all_attr.begin(), all_attr.end());
 
   baserel->fdw_private = ss;
   return make_foreignscan(tlist, nullptr, baserel->relid, nullptr, (List*)(baserel->fdw_private), nullptr, nullptr, outer_plan);
