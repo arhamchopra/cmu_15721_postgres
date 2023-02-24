@@ -40,7 +40,7 @@ using namespace::std;
 #include <iostream>
 
 void debug(string str) {
-  cout << str << endl;
+  // cout << str << endl;
 }
 
 enum DataType {
@@ -161,12 +161,13 @@ struct db721_ColumnMetadata {
     data_type(string_to_datatype(json_obj["type"])),
     data_size(data_type_to_size(data_type))
   {
-    auto& block_stats = json_obj["block_stats"];
     int start_offset = json_obj["start_offset"];
-    for(auto it = block_stats.begin(); it != block_stats.end(); ++it) {
+    int block_idx = 0;
+    for(block_idx = 0; block_idx < num_blocks; block_idx++) {
+      auto& json_block = json_obj["block_stats"][to_string(block_idx)];
       switch (data_type) {
         case IntType: {
-                        auto blk = db721_BlockMetadataInt(it.value());
+                        auto blk = db721_BlockMetadataInt(json_block);
                         block_list.emplace_back(blk);
                         block_offset_list.push_back(start_offset);
                         row_count_list.push_back(blk.num_val);
@@ -174,7 +175,7 @@ struct db721_ColumnMetadata {
                         break;
                       }
         case FloatType: {
-                          auto blk = db721_BlockMetadataFloat(it.value());
+                          auto blk = db721_BlockMetadataFloat(json_block);
                           block_list.emplace_back(blk);
                           block_offset_list.push_back(start_offset);
                           row_count_list.push_back(blk.num_val);
@@ -182,7 +183,7 @@ struct db721_ColumnMetadata {
                           break;
                         }
         case StringType: {
-                           auto blk = db721_BlockMetadataString(it.value());
+                           auto blk = db721_BlockMetadataString(json_block);
                            block_list.emplace_back(blk);
                            block_offset_list.push_back(start_offset);
                            row_count_list.push_back(blk.num_val);
@@ -215,7 +216,9 @@ struct db721_TableMetadata {
   vector<db721_ColumnMetadata> column_data;
   int max_val_per_block;
   int num_rows;
+  vector<int> relevant_blocks;
   int row_width;
+  int num_blocks;
 
   vector<vector<RowFilter>> rfs;
 
@@ -241,6 +244,7 @@ struct db721_TableMetadata {
       }
       num_rows = 0;
       if (column_data.size()) {
+        num_blocks = column_data[0].num_blocks;
         for(auto& blk: column_data[0].block_list) {
           int cur_blk_rows = 0;
           switch (column_data[0].data_type) {
@@ -253,6 +257,103 @@ struct db721_TableMetadata {
         }
       }
     }
+
+  void extract_relevant_blocks() {
+    vector<bool> useful_block(num_blocks, true);
+    for(size_t attrnum = 0; attrnum < column_data.size(); attrnum++) {
+      for(auto &rf: rfs[attrnum]) {
+        auto &col_data = column_data[attrnum];
+
+        Datum     const_val = rf.const_val->constvalue;
+        int       collid = rf.const_val->constcollid;
+        int       strategy = rf.strategy;
+        FmgrInfo* finfo = &rf.finfo;
+        bool      neg = rf.neg;
+
+        for(int block_idx = 0; block_idx < num_blocks; block_idx++) {
+          if (not useful_block[block_idx]) continue;
+          auto &blk = col_data.block_list[block_idx];
+          Datum data_max;
+          Datum data_min;
+          switch (col_data.data_type) {
+            case IntType:
+              {
+                data_max = Int32GetDatum(get<db721_BlockMetadataInt>(blk).max_val);
+                data_min = Int32GetDatum(get<db721_BlockMetadataInt>(blk).min_val);
+                break;
+              }
+            case FloatType:
+              {
+                data_max = Float4GetDatum(get<db721_BlockMetadataFloat>(blk).max_val);
+                data_min = Float4GetDatum(get<db721_BlockMetadataFloat>(blk).min_val);
+                break;
+              }
+            case StringType:
+              {
+                data_max = CStringGetTextDatum(get<db721_BlockMetadataString>(blk).max_val.c_str());
+                data_min = CStringGetTextDatum(get<db721_BlockMetadataString>(blk).min_val.c_str());
+                break;
+              }
+            default: { cout << "Error: NoneType found" << endl; break;}
+          }
+          int     cmpres_max;
+          int     cmpres_min;
+          bool    satisfies;
+          // debug("Checking strategy " + to_string(block_idx) + " for block " + to_string(block_idx) + " for attr " + to_string(attrnum));
+          switch(strategy) {
+            case BTLessStrategyNumber:
+              {
+                cmpres_min = FunctionCall2Coll(finfo, collid, const_val, data_min);
+                satisfies = (cmpres_min > 0) ^ neg;
+                // debug("In less " + to_string(DatumGetFloat4(data_min)) + " BTLess " + to_string(DatumGetFloat8(const_val)) + "=" + to_string(cmpres_min));
+                break;
+              }
+            case BTLessEqualStrategyNumber:
+              {
+                cmpres_min = FunctionCall2Coll(finfo, collid, const_val, data_min);
+                satisfies = (cmpres_min >= 0) ^ neg;
+                // debug("In lesseq " + to_string(DatumGetFloat4(data_min)) + " BTLess " + to_string(DatumGetFloat8(const_val)) + "=" + to_string(cmpres_min));
+                break;
+              }
+            case BTGreaterStrategyNumber:
+              {
+                cmpres_max = FunctionCall2Coll(finfo, collid, const_val, data_max);
+                satisfies = (cmpres_max < 0) ^ neg;
+                // debug("In more " + to_string(DatumGetFloat4(data_min)) + " BTLess " + to_string(DatumGetFloat8(const_val)) + "=" + to_string(cmpres_min));
+                break;
+              }
+            case BTGreaterEqualStrategyNumber:
+              {
+                cmpres_max = FunctionCall2Coll(finfo, collid, const_val, data_max);
+                satisfies = (cmpres_max <= 0) ^ neg;
+                // debug("In moreeq " + to_string(DatumGetFloat4(data_min)) + " BTLess " + to_string(DatumGetFloat8(const_val)) + "=" + to_string(cmpres_min));
+                break;
+              }
+            case BTEqualStrategyNumber:
+              {
+                cmpres_min = FunctionCall2Coll(finfo, collid, const_val, data_min);
+                cmpres_max = FunctionCall2Coll(finfo, collid, const_val, data_max);
+                // debug("In eq " + to_string(DatumGetFloat4(data_min)) + " BTLess " + to_string(DatumGetFloat8(const_val)) + "=" + to_string(cmpres_min));
+                if (neg) {
+                  satisfies = ((cmpres_min != 0) || (cmpres_max != 0));
+                } else {
+                  satisfies = ((cmpres_min >= 0) && (cmpres_max <= 0));
+                }
+                break;
+              }
+            default: Assert(false);
+          }
+          // debug("Block usefulness is " + to_string(satisfies));
+          useful_block[block_idx] = satisfies;
+        }
+      }
+    }
+    for(int block_idx = 0; block_idx < num_blocks; block_idx++) {
+      if (not useful_block[block_idx]) continue;
+      // debug("Useful blocks are " + to_string(block_idx));
+      relevant_blocks.push_back(block_idx);
+    }
+  }
 
   void print() {
     cout << "Filename: " << this->filename << endl;
@@ -302,14 +403,14 @@ struct db721_ScanState {
   vector<AttrNumber> v_attrs_returned;
   vector<AttrNumber> v_attrs_combined;
   vector<char*> block_data;
-  int next_block = 0;
+  uint next_block_idx = 0;
   int num_blocks = 0;
 
   db721_ScanState (db721_TableMetadata* metadata):
     metadata(metadata),
     cur_row_in_block(0),
     num_rows_in_block(0),
-    next_block(0) {
+    next_block_idx(0) {
       num_blocks = metadata->column_data[0].num_blocks;
       for(auto &col: metadata->column_data) {
         fds.emplace_back(metadata->filename, ifstream::binary);
@@ -319,13 +420,15 @@ struct db721_ScanState {
 
   TupleTableSlot* next(TupleTableSlot* slot) {
     auto& rfs = metadata->rfs;
+    auto& relevant_blocks = metadata->relevant_blocks;
     auto* tuple_desc = slot->tts_tupleDescriptor;
     // TODO: Fix bug to process the whole tuple each time
     while(true) {
       if (cur_row_in_block >= num_rows_in_block) {
-        if (next_block >= num_blocks) {
+        if (next_block_idx >= relevant_blocks.size()) {
           return nullptr;
         }
+        auto next_block = relevant_blocks[next_block_idx++];
         for(size_t attr_idx = 0; attr_idx < v_attrs_combined.size(); attr_idx++) {
           auto attrnum = v_attrs_combined[attr_idx];
           auto &col_data = metadata->column_data[attrnum];
@@ -334,7 +437,6 @@ struct db721_ScanState {
           fs.read(block_data[attrnum], col_data.row_count_list[next_block] * col_data.data_size);
           num_rows_in_block = col_data.row_count_list[next_block];
         }
-        next_block++;
         cur_row_in_block = 0;
       }
 
@@ -408,13 +510,13 @@ struct db721_ScanState {
       slot->tts_isnull[attrnum] = false;
     }
     cur_row_in_block++;
-  // text* t = (text*) palloc(col_data.data_size+VARHDRSZ);
-  // char data[32] = {};
-  // fs.read(data, col_data.data_size);
-  // SET_VARSIZE(t, col_data.data_size+VARHDRSZ);
-  // memcpy(VARDATA(t), data, col_data.data_size);
-  // slot->tts_values[attr] = PointerGetDatum(t);
-  // slot->tts_isnull[attr] = false;
+    // text* t = (text*) palloc(col_data.data_size+VARHDRSZ);
+    // char data[32] = {};
+    // fs.read(data, col_data.data_size);
+    // SET_VARSIZE(t, col_data.data_size+VARHDRSZ);
+    // memcpy(VARDATA(t), data, col_data.data_size);
+    // slot->tts_values[attr] = PointerGetDatum(t);
+    // slot->tts_isnull[attr] = false;
     return slot;
   }
 };
@@ -547,10 +649,6 @@ void extract_row_filters(RelOptInfo* baserel, vector<vector<RowFilter>> &rfs) {
   }
 }
 
-pair<Cost, Cost> estimate_costs(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid) {
-  return make_pair(0.0, 0.0);
-}
-
 void get_relevant_attrs(RelOptInfo* baserel) {
   db721_QueryPlan* query_plan = (db721_QueryPlan*) baserel->fdw_private;
   pull_varattnos((Node *) baserel->reltarget->exprs, baserel->relid, &query_plan->attrs_returned);
@@ -560,6 +658,10 @@ void get_relevant_attrs(RelOptInfo* baserel) {
     RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
     pull_varattnos((Node *) rinfo->clause, baserel->relid, &query_plan->attrs_used);
   }
+}
+
+pair<Cost, Cost> estimate_costs(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid) {
+  return make_pair(0.0, 0.0);
 }
 
 extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
@@ -580,6 +682,9 @@ extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
   metadata.rfs.clear();
   metadata.rfs.resize(metadata.column_data.size());
   extract_row_filters(baserel, metadata.rfs);
+  metadata.relevant_blocks.clear();
+  metadata.extract_relevant_blocks();
+
 
   baserel->fdw_private = &metadata;
   baserel->reltarget->width = metadata.row_width;
