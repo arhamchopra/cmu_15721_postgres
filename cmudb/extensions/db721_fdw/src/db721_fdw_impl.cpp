@@ -90,6 +90,7 @@ struct db721_BlockMetadataInt {
   int max_val;
   int min_val;
   int num_val;
+  db721_BlockMetadataInt() {}
   db721_BlockMetadataInt(JsonType &json_obj):
     max_val(json_obj["max"]),
     min_val(json_obj["min"]),
@@ -106,6 +107,7 @@ struct db721_BlockMetadataFloat {
   float max_val;
   float min_val;
   int num_val;
+  db721_BlockMetadataFloat() {}
   db721_BlockMetadataFloat(JsonType &json_obj):
     max_val(json_obj["max"]),
     min_val(json_obj["min"]),
@@ -123,6 +125,7 @@ struct db721_BlockMetadataString {
   string min_val;
   int min_val_len;
   int num_val;
+  db721_BlockMetadataString() {}
   db721_BlockMetadataString(JsonType &json_obj):
     max_val(json_obj["max"]),
     max_val_len(json_obj["max_len"]),
@@ -148,6 +151,7 @@ struct db721_ColumnMetadata {
   int start_offset;
   DataType data_type;
   int data_size;
+  char* global_block;
 
   db721_ColumnMetadata():
     num_blocks(0),
@@ -161,6 +165,21 @@ struct db721_ColumnMetadata {
     data_type(string_to_datatype(json_obj["type"])),
     data_size(data_type_to_size(data_type))
   {
+    switch (data_type) {
+      case IntType: {
+                      global_block = (char*)new db721_BlockMetadataInt();
+                      break;
+                    }
+      case FloatType: {
+                        global_block = (char*)new db721_BlockMetadataFloat();
+                        break;
+                      }
+      case StringType: {
+                         global_block = (char*)new db721_BlockMetadataString();
+                         break;
+                       }
+      default: { cout << "Error: NoneType found" << endl; break;}
+    }
     int start_offset = json_obj["start_offset"];
     int block_idx = 0;
     for(block_idx = 0; block_idx < num_blocks; block_idx++) {
@@ -172,6 +191,9 @@ struct db721_ColumnMetadata {
                         block_offset_list.push_back(start_offset);
                         row_count_list.push_back(blk.num_val);
                         start_offset += blk.num_val * data_size;
+                        auto& gblk = *(db721_BlockMetadataInt*)global_block;
+                        gblk.max_val = max(gblk.max_val, blk.max_val);
+                        gblk.min_val = min(gblk.min_val, blk.min_val);
                         break;
                       }
         case FloatType: {
@@ -180,6 +202,9 @@ struct db721_ColumnMetadata {
                           block_offset_list.push_back(start_offset);
                           row_count_list.push_back(blk.num_val);
                           start_offset += blk.num_val * data_size;
+                          auto& gblk = *(db721_BlockMetadataFloat*)global_block;
+                          gblk.max_val = max(gblk.max_val, blk.max_val);
+                          gblk.min_val = min(gblk.min_val, blk.min_val);
                           break;
                         }
         case StringType: {
@@ -188,6 +213,9 @@ struct db721_ColumnMetadata {
                            block_offset_list.push_back(start_offset);
                            row_count_list.push_back(blk.num_val);
                            start_offset += blk.num_val * data_size;
+                           auto& gblk = *(db721_BlockMetadataString*)global_block;
+                           gblk.max_val = max(gblk.max_val, blk.max_val);
+                           gblk.min_val = min(gblk.min_val, blk.min_val);
                            break;
                          }
         default: { cout << "Error: NoneType found" << endl; break;}
@@ -210,6 +238,45 @@ struct db721_ColumnMetadata {
     }
   }
 };
+
+bool check_conditions(FmgrInfo* finfo, Oid collid, int strategy, Datum const_val, Datum data_min, Datum data_max, bool neg) {
+  int cmpres_min, cmpres_max;
+  // debug("Checking strategy " + to_string(block_idx) + " for block " + to_string(block_idx) + " for attr " + to_string(attrnum));
+  switch(strategy) {
+    case BTLessStrategyNumber:
+      {
+        cmpres_min = FunctionCall2Coll(finfo, collid, const_val, data_min);
+        return (cmpres_min > 0) ^ neg;
+      }
+    case BTLessEqualStrategyNumber:
+      {
+        cmpres_min = FunctionCall2Coll(finfo, collid, const_val, data_min);
+        return (cmpres_min >= 0) ^ neg;
+      }
+    case BTGreaterStrategyNumber:
+      {
+        cmpres_max = FunctionCall2Coll(finfo, collid, const_val, data_max);
+        return (cmpres_max < 0) ^ neg;
+      }
+    case BTGreaterEqualStrategyNumber:
+      {
+        cmpres_max = FunctionCall2Coll(finfo, collid, const_val, data_max);
+        return (cmpres_max <= 0) ^ neg;
+      }
+    case BTEqualStrategyNumber:
+      {
+        cmpres_min = FunctionCall2Coll(finfo, collid, const_val, data_min);
+        cmpres_max = FunctionCall2Coll(finfo, collid, const_val, data_max);
+        // debug("In eq " + to_string(DatumGetFloat4(data_min)) + " BTLess " + to_string(DatumGetFloat8(const_val)) + "=" + to_string(cmpres_min));
+        if (neg) {
+          return ((cmpres_min != 0) || (cmpres_max != 0));
+        } else {
+          return ((cmpres_min >= 0) && (cmpres_max <= 0));
+        }
+      }
+    default: Assert(false);
+  }
+}
 
 struct db721_TableMetadata {
   string filename;
@@ -270,11 +337,40 @@ struct db721_TableMetadata {
         FmgrInfo* finfo = &rf.finfo;
         bool      neg = rf.neg;
 
+        Datum data_max;
+        Datum data_min;
+        switch (col_data.data_type) {
+          case IntType:
+            {
+              auto& gblk = *(db721_BlockMetadataInt*)(col_data.global_block);
+              data_max = Int32GetDatum(gblk.max_val);
+              data_min = Int32GetDatum(gblk.min_val);
+              break;
+            }
+          case FloatType:
+            {
+              auto& gblk = *(db721_BlockMetadataFloat*)(col_data.global_block);
+              data_max = Float4GetDatum(gblk.max_val);
+              data_min = Float4GetDatum(gblk.min_val);
+              break;
+            }
+          case StringType:
+            {
+              auto& gblk = *(db721_BlockMetadataString*)(col_data.global_block);
+              data_max = CStringGetTextDatum(gblk.max_val.c_str());
+              data_min = CStringGetTextDatum(gblk.min_val.c_str());
+              break;
+            }
+          default: { cout << "Error: NoneType found" << endl; break;}
+        }
+        if (not check_conditions(finfo, collid, strategy, const_val, data_min, data_max, neg)) {
+          relevant_blocks.clear();
+          return;
+        }
+
         for(int block_idx = 0; block_idx < num_blocks; block_idx++) {
           if (not useful_block[block_idx]) continue;
           auto &blk = col_data.block_list[block_idx];
-          Datum data_max;
-          Datum data_min;
           switch (col_data.data_type) {
             case IntType:
               {
@@ -296,55 +392,7 @@ struct db721_TableMetadata {
               }
             default: { cout << "Error: NoneType found" << endl; break;}
           }
-          int     cmpres_max;
-          int     cmpres_min;
-          bool    satisfies;
-          // debug("Checking strategy " + to_string(block_idx) + " for block " + to_string(block_idx) + " for attr " + to_string(attrnum));
-          switch(strategy) {
-            case BTLessStrategyNumber:
-              {
-                cmpres_min = FunctionCall2Coll(finfo, collid, const_val, data_min);
-                satisfies = (cmpres_min > 0) ^ neg;
-                // debug("In less " + to_string(DatumGetFloat4(data_min)) + " BTLess " + to_string(DatumGetFloat8(const_val)) + "=" + to_string(cmpres_min));
-                break;
-              }
-            case BTLessEqualStrategyNumber:
-              {
-                cmpres_min = FunctionCall2Coll(finfo, collid, const_val, data_min);
-                satisfies = (cmpres_min >= 0) ^ neg;
-                // debug("In lesseq " + to_string(DatumGetFloat4(data_min)) + " BTLess " + to_string(DatumGetFloat8(const_val)) + "=" + to_string(cmpres_min));
-                break;
-              }
-            case BTGreaterStrategyNumber:
-              {
-                cmpres_max = FunctionCall2Coll(finfo, collid, const_val, data_max);
-                satisfies = (cmpres_max < 0) ^ neg;
-                // debug("In more " + to_string(DatumGetFloat4(data_min)) + " BTLess " + to_string(DatumGetFloat8(const_val)) + "=" + to_string(cmpres_min));
-                break;
-              }
-            case BTGreaterEqualStrategyNumber:
-              {
-                cmpres_max = FunctionCall2Coll(finfo, collid, const_val, data_max);
-                satisfies = (cmpres_max <= 0) ^ neg;
-                // debug("In moreeq " + to_string(DatumGetFloat4(data_min)) + " BTLess " + to_string(DatumGetFloat8(const_val)) + "=" + to_string(cmpres_min));
-                break;
-              }
-            case BTEqualStrategyNumber:
-              {
-                cmpres_min = FunctionCall2Coll(finfo, collid, const_val, data_min);
-                cmpres_max = FunctionCall2Coll(finfo, collid, const_val, data_max);
-                // debug("In eq " + to_string(DatumGetFloat4(data_min)) + " BTLess " + to_string(DatumGetFloat8(const_val)) + "=" + to_string(cmpres_min));
-                if (neg) {
-                  satisfies = ((cmpres_min != 0) || (cmpres_max != 0));
-                } else {
-                  satisfies = ((cmpres_min >= 0) && (cmpres_max <= 0));
-                }
-                break;
-              }
-            default: Assert(false);
-          }
-          // debug("Block usefulness is " + to_string(satisfies));
-          useful_block[block_idx] = satisfies;
+          useful_block[block_idx] = check_conditions(finfo, collid, strategy, const_val, data_min, data_max, neg);
         }
       }
     }
@@ -545,6 +593,7 @@ void initialize(Oid foreigntableid, TupleDescData* tupleDesc, string &filename) 
   fs.read(metadata_str, metadata_size);
 
   auto json = JsonType::parse(metadata_str);
+  // cout << json.dump(true) << endl;
   gMetadataMap.emplace(foreigntableid, db721_TableMetadata{json, tupleDesc, filename});
 }
 
