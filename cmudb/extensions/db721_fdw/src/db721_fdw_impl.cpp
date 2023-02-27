@@ -43,6 +43,7 @@ void debug(string str) {
   // cout << str << endl;
 }
 
+// Hardcoding the supported datatypes
 enum DataType {
   IntType,
   FloatType,
@@ -70,6 +71,7 @@ int data_type_to_size(DataType dt) {
   }
 }
 
+// Preprocess and create the FmgrInfo struct for use in comparision in the future
 struct RowFilter {
   FmgrInfo finfo;
   Var* var;
@@ -86,10 +88,11 @@ struct RowFilter {
     }
 };
 
+// To store information about each of the blocks -- One for each of the datatypes
 struct db721_BlockMetadataInt {
-  int max_val;
-  int min_val;
-  int num_val;
+  int max_val = 0;
+  int min_val = 0;
+  int num_val = 0;
   db721_BlockMetadataInt() {}
   db721_BlockMetadataInt(JsonType &json_obj):
     max_val(json_obj["max"]),
@@ -104,9 +107,9 @@ struct db721_BlockMetadataInt {
 };
 
 struct db721_BlockMetadataFloat {
-  float max_val;
-  float min_val;
-  int num_val;
+  float max_val = 0;
+  float min_val = 0;
+  int num_val = 0;
   db721_BlockMetadataFloat() {}
   db721_BlockMetadataFloat(JsonType &json_obj):
     max_val(json_obj["max"]),
@@ -121,10 +124,10 @@ struct db721_BlockMetadataFloat {
 
 struct db721_BlockMetadataString {
   string max_val;
-  int max_val_len;
+  int max_val_len = 0;
   string min_val;
-  int min_val_len;
-  int num_val;
+  int min_val_len = 0;
+  int num_val = 0;
   db721_BlockMetadataString() {}
   db721_BlockMetadataString(JsonType &json_obj):
     max_val(json_obj["max"]),
@@ -141,47 +144,54 @@ struct db721_BlockMetadataString {
   }
 };
 
+// Use variants to ease programming in the following code and hoping to not use void* with reinterpret_casting :p
 using db721_BlockMetadata = std::variant<db721_BlockMetadataInt, db721_BlockMetadataFloat, db721_BlockMetadataString>;
 
+// To keep track of all information about a column of the foreign data
 struct db721_ColumnMetadata {
+  // List of blocks
   vector<db721_BlockMetadata> block_list;
+  // Starting offsets of the blocks
   vector<int> block_offset_list;
+  // Keep track of the number of rows in each block could be replaced with a pair of integers since num_rows is the same for all blocks before the last one
   vector<int> row_count_list;
+  // Total number of blocks -- Redundant
   int num_blocks;
-  int start_offset;
+  // Type of the data being stored
   DataType data_type;
+  // Store the data size to avoid function call
   int data_size;
-  char* global_block;
+  // Global information across the blocks
+  db721_BlockMetadata global_block;
 
   db721_ColumnMetadata():
     num_blocks(0),
-    start_offset(0),
     data_type(NoneType),
     data_size(0) { }
 
   db721_ColumnMetadata(JsonType &json_obj):
     num_blocks(json_obj["num_blocks"]),
-    start_offset(json_obj["start_offset"]),
     data_type(string_to_datatype(json_obj["type"])),
     data_size(data_type_to_size(data_type))
   {
     switch (data_type) {
       case IntType: {
-                      global_block = (char*)new db721_BlockMetadataInt();
+                      global_block = db721_BlockMetadataInt();
                       break;
                     }
       case FloatType: {
-                        global_block = (char*)new db721_BlockMetadataFloat();
+                        global_block = db721_BlockMetadataFloat();
                         break;
                       }
       case StringType: {
-                         global_block = (char*)new db721_BlockMetadataString();
+                         global_block = db721_BlockMetadataString();
                          break;
                        }
       default: { cout << "Error: NoneType found" << endl; break;}
     }
     int start_offset = json_obj["start_offset"];
     int block_idx = 0;
+    // Important to load data in right numerical order and json is sorted in lexical order
     for(block_idx = 0; block_idx < num_blocks; block_idx++) {
       auto& json_block = json_obj["block_stats"][to_string(block_idx)];
       switch (data_type) {
@@ -191,7 +201,7 @@ struct db721_ColumnMetadata {
                         block_offset_list.push_back(start_offset);
                         row_count_list.push_back(blk.num_val);
                         start_offset += blk.num_val * data_size;
-                        auto& gblk = *(db721_BlockMetadataInt*)global_block;
+                        auto& gblk = get<db721_BlockMetadataInt>(global_block);
                         gblk.max_val = max(gblk.max_val, blk.max_val);
                         gblk.min_val = min(gblk.min_val, blk.min_val);
                         break;
@@ -202,7 +212,7 @@ struct db721_ColumnMetadata {
                           block_offset_list.push_back(start_offset);
                           row_count_list.push_back(blk.num_val);
                           start_offset += blk.num_val * data_size;
-                          auto& gblk = *(db721_BlockMetadataFloat*)global_block;
+                          auto& gblk = get<db721_BlockMetadataFloat>(global_block);
                           gblk.max_val = max(gblk.max_val, blk.max_val);
                           gblk.min_val = min(gblk.min_val, blk.min_val);
                           break;
@@ -213,7 +223,7 @@ struct db721_ColumnMetadata {
                            block_offset_list.push_back(start_offset);
                            row_count_list.push_back(blk.num_val);
                            start_offset += blk.num_val * data_size;
-                           auto& gblk = *(db721_BlockMetadataString*)global_block;
+                           auto& gblk = get<db721_BlockMetadataString>(global_block);
                            gblk.max_val = max(gblk.max_val, blk.max_val);
                            gblk.min_val = min(gblk.min_val, blk.min_val);
                            break;
@@ -225,7 +235,6 @@ struct db721_ColumnMetadata {
 
   void print() {
     cout << "NumBlocks: " << this->num_blocks << endl;
-    cout << "StartOffset: " << this->start_offset << endl;
     cout << "DataTypeEnum: " << this->data_type << endl;
     for(auto& block_val: this->block_list) {
       switch (this->data_type) {
@@ -239,9 +248,9 @@ struct db721_ColumnMetadata {
   }
 };
 
+// Check conditions for const value against the min and max values
 bool check_conditions(FmgrInfo* finfo, Oid collid, int strategy, Datum const_val, Datum data_min, Datum data_max, bool neg) {
   int cmpres_min, cmpres_max;
-  // debug("Checking strategy " + to_string(block_idx) + " for block " + to_string(block_idx) + " for attr " + to_string(attrnum));
   switch(strategy) {
     case BTLessStrategyNumber:
       {
@@ -267,7 +276,7 @@ bool check_conditions(FmgrInfo* finfo, Oid collid, int strategy, Datum const_val
       {
         cmpres_min = FunctionCall2Coll(finfo, collid, const_val, data_min);
         cmpres_max = FunctionCall2Coll(finfo, collid, const_val, data_max);
-        // debug("In eq " + to_string(DatumGetFloat4(data_min)) + " BTLess " + to_string(DatumGetFloat8(const_val)) + "=" + to_string(cmpres_min));
+        // Special handling for neg
         if (neg) {
           return ((cmpres_min != 0) || (cmpres_max != 0));
         } else {
@@ -278,16 +287,19 @@ bool check_conditions(FmgrInfo* finfo, Oid collid, int strategy, Datum const_val
   }
 }
 
+// Store all metadata information for a table, also stores the row filters for a query.
 struct db721_TableMetadata {
+  // These won't change as insert/updates are not supported
   string filename;
   vector<db721_ColumnMetadata> column_data;
   int max_val_per_block;
   int num_rows;
-  vector<int> relevant_blocks;
   int row_width;
   int num_blocks;
 
+  // Should reset these at the start of each query
   vector<vector<RowFilter>> rfs;
+  vector<int> relevant_blocks;
 
   db721_TableMetadata () {
   }
@@ -325,6 +337,7 @@ struct db721_TableMetadata {
       }
     }
 
+  // Apply row filters to the block metadata and get only the useful blocks
   void extract_relevant_blocks() {
     vector<bool> useful_block(num_blocks, true);
     for(size_t attrnum = 0; attrnum < column_data.size(); attrnum++) {
@@ -339,35 +352,37 @@ struct db721_TableMetadata {
 
         Datum data_max;
         Datum data_min;
+        // Check global information first
         switch (col_data.data_type) {
           case IntType:
             {
-              auto& gblk = *(db721_BlockMetadataInt*)(col_data.global_block);
+              auto& gblk = get<db721_BlockMetadataInt>(col_data.global_block);
               data_max = Int32GetDatum(gblk.max_val);
               data_min = Int32GetDatum(gblk.min_val);
               break;
             }
           case FloatType:
             {
-              auto& gblk = *(db721_BlockMetadataFloat*)(col_data.global_block);
+              auto& gblk = get<db721_BlockMetadataFloat>(col_data.global_block);
               data_max = Float4GetDatum(gblk.max_val);
               data_min = Float4GetDatum(gblk.min_val);
               break;
             }
           case StringType:
             {
-              auto& gblk = *(db721_BlockMetadataString*)(col_data.global_block);
+              auto& gblk = get<db721_BlockMetadataString>(col_data.global_block);
               data_max = CStringGetTextDatum(gblk.max_val.c_str());
               data_min = CStringGetTextDatum(gblk.min_val.c_str());
               break;
             }
-          default: { cout << "Error: NoneType found" << endl; break;}
+          default: { cout << "Error: NoneType found" << endl; assert(false); break;}
         }
         if (not check_conditions(finfo, collid, strategy, const_val, data_min, data_max, neg)) {
           relevant_blocks.clear();
           return;
         }
 
+        // Check individual blocks
         for(int block_idx = 0; block_idx < num_blocks; block_idx++) {
           if (not useful_block[block_idx]) continue;
           auto &blk = col_data.block_list[block_idx];
@@ -396,9 +411,9 @@ struct db721_TableMetadata {
         }
       }
     }
+    // Store all the useful blocks
     for(int block_idx = 0; block_idx < num_blocks; block_idx++) {
       if (not useful_block[block_idx]) continue;
-      // debug("Useful blocks are " + to_string(block_idx));
       relevant_blocks.push_back(block_idx);
     }
   }
@@ -413,8 +428,10 @@ struct db721_TableMetadata {
   }
 };
 
+// Map to cache metadata and avoid loading multiple times
 map<Oid, db721_TableMetadata> gMetadataMap;
 
+// Extract datum from memory
 void extract_next_datum(char* data_array, db721_ColumnMetadata &col_data, int idx, Datum &datum) {
   switch (col_data.data_type) {
     case IntType: {
@@ -444,15 +461,21 @@ void extract_next_datum(char* data_array, db721_ColumnMetadata &col_data, int id
 
 struct db721_ScanState {
   db721_TableMetadata* metadata;
+  // On filestream per column to avoid excessive seeks and maybe take advantage of locality
   vector<ifstream> fds;
   int cur_row_in_block = 0;
   int num_rows_in_block = 0;
+  // Keep track of all relevant attributes
   vector<AttrNumber> v_attrs_used;
   vector<AttrNumber> v_attrs_returned;
   vector<AttrNumber> v_attrs_combined;
+  // Load data for a block into memory for faster access assuming it can fit, should be okay otherwise need to implement paging of blocks in memory
   vector<char*> block_data;
   uint next_block_idx = 0;
   int num_blocks = 0;
+
+  ~db721_ScanState() {
+  }
 
   db721_ScanState (db721_TableMetadata* metadata):
     metadata(metadata),
@@ -470,7 +493,6 @@ struct db721_ScanState {
     auto& rfs = metadata->rfs;
     auto& relevant_blocks = metadata->relevant_blocks;
     auto* tuple_desc = slot->tts_tupleDescriptor;
-    // TODO: Fix bug to process the whole tuple each time
     while(true) {
       if (cur_row_in_block >= num_rows_in_block) {
         if (next_block_idx >= relevant_blocks.size()) {
@@ -517,7 +539,6 @@ struct db721_ScanState {
                 satisfies = (cmpres >= 0) ^ neg;
                 break;
               }
-
             case BTGreaterStrategyNumber:
               {
                 satisfies = (cmpres < 0) ^ neg;
@@ -558,13 +579,6 @@ struct db721_ScanState {
       slot->tts_isnull[attrnum] = false;
     }
     cur_row_in_block++;
-    // text* t = (text*) palloc(col_data.data_size+VARHDRSZ);
-    // char data[32] = {};
-    // fs.read(data, col_data.data_size);
-    // SET_VARSIZE(t, col_data.data_size+VARHDRSZ);
-    // memcpy(VARDATA(t), data, col_data.data_size);
-    // slot->tts_values[attr] = PointerGetDatum(t);
-    // slot->tts_isnull[attr] = false;
     return slot;
   }
 };
@@ -593,8 +607,8 @@ void initialize(Oid foreigntableid, TupleDescData* tupleDesc, string &filename) 
   fs.read(metadata_str, metadata_size);
 
   auto json = JsonType::parse(metadata_str);
-  // cout << json.dump(true) << endl;
   gMetadataMap.emplace(foreigntableid, db721_TableMetadata{json, tupleDesc, filename});
+  delete metadata_str;
 }
 
 string get_foreign_table_info(Oid foreigntableid) {
@@ -709,6 +723,7 @@ void get_relevant_attrs(RelOptInfo* baserel) {
   }
 }
 
+// Only have one plan so costs don't really matter
 pair<Cost, Cost> estimate_costs(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid) {
   return make_pair(0.0, 0.0);
 }
@@ -728,10 +743,8 @@ extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 
   auto& metadata = gMetadataMap[foreigntableid];
   // TODO: Move cleanup to the db721_EndForeignScan
-  metadata.rfs.clear();
   metadata.rfs.resize(metadata.column_data.size());
   extract_row_filters(baserel, metadata.rfs);
-  metadata.relevant_blocks.clear();
   metadata.extract_relevant_blocks();
 
 
@@ -739,8 +752,7 @@ extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
   baserel->reltarget->width = metadata.row_width;
   baserel->tuples = metadata.num_rows;
 
-  // Use ZoneMaps to find a good estimate of the rows
-  // TODO : Account of the "WHERE" filters
+  // TODO: Use zone maps to find better estimates
   baserel->rows = metadata.num_rows;
 }
 
@@ -783,6 +795,7 @@ db721_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
     ss->v_attrs_used.push_back(attr - (1 - FirstLowInvalidHeapAttributeNumber));
     all_attr.insert(attr - (1 - FirstLowInvalidHeapAttributeNumber));
   }
+  // Better ordering based on the attr types could be used
   sort(ss->v_attrs_used.begin(), ss->v_attrs_used.end());
   attr = -1;
   while ((attr = bms_next_member(query_plan->attrs_returned, attr)) >= 0) {
@@ -793,6 +806,10 @@ db721_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
   ss->v_attrs_combined = vector(all_attr.begin(), all_attr.end());
 
   baserel->fdw_private = ss;
+
+  // TODO: Free used memory
+  // pfree(query_plan);
+
   return make_foreignscan(tlist, nullptr, baserel->relid, nullptr, (List*)(baserel->fdw_private), nullptr, nullptr, outer_plan);
 }
 
@@ -818,5 +835,11 @@ extern "C" void db721_ReScanForeignScan(ForeignScanState *node) {
 }
 
 extern "C" void db721_EndForeignScan(ForeignScanState *node) {
-  // TODO(721): Write me!
+  db721_ScanState* ss = (db721_ScanState*)node->fdw_state;
+  ss->metadata->rfs.clear();
+  ss->metadata->relevant_blocks.clear();
+  for(size_t attr_idx = 0; attr_idx < ss->v_attrs_combined.size(); attr_idx++) {
+    pfree(ss->block_data[attr_idx]);
+  }
+  delete ss;
 }
