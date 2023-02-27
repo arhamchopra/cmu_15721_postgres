@@ -725,7 +725,8 @@ void get_relevant_attrs(RelOptInfo* baserel) {
 
 // Only have one plan so costs don't really matter
 pair<Cost, Cost> estimate_costs(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid) {
-  return make_pair(0.0, 0.0);
+  db721_QueryPlan* qp = (db721_QueryPlan*)baserel->fdw_private;
+  return make_pair(qp->metadata->num_blocks, qp->metadata->num_rows);
 }
 
 extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
@@ -831,7 +832,10 @@ extern "C" TupleTableSlot *db721_IterateForeignScan(ForeignScanState *node) {
 }
 
 extern "C" void db721_ReScanForeignScan(ForeignScanState *node) {
-  // TODO(721): Write me!
+  db721_ScanState* ss = (db721_ScanState*)node->fdw_state;
+  ss->num_rows_in_block = 0;
+  ss->cur_row_in_block = 0;
+  ss->next_block_idx = 0;
 }
 
 extern "C" void db721_EndForeignScan(ForeignScanState *node) {
